@@ -16,9 +16,9 @@ cql_target_action_gap: 0.8
 cql_temp: 1.0
 device: cuda
 discount: 0.99
-env: antmaze-large-play-v2
+env: antmaze-umaze-diverse-v2
 eval_freq: 50000
-group: cql-antmaze-large-play-v2-multiseed-v0
+group: cql-antmaze-umaze-diverse-v2-multiseed-v0
 load_model: ''
 offline_iterations: 1000000
 online_iterations: 1000000
