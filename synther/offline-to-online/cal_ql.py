@@ -4,7 +4,7 @@ import os
 import random
 import uuid
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -17,6 +17,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from torch.distributions import Normal, TanhTransform, TransformedDistribution
+
+from synther.corl.shared.buffer import prepare_replay_buffer, RewardNormalizer, StateNormalizer, DiffusionConfig, ReplayBuffer
+from synther.corl.shared.logger import Logger
 
 TensorBatch = List[torch.Tensor]
 
@@ -67,6 +70,18 @@ class TrainConfig:
     # Cal-QL
     mixing_ratio: float = 0.5  # Data mixing ratio for online tuning
     is_sparse_reward: bool = False  # Use sparse reward
+    # OOTD
+    reset_freq: int = 1000
+    buffer: DiffusionConfig = field(default_factory=DiffusionConfig)
+    diffusion: DiffusionConfig = field(default_factory=DiffusionConfig)
+    start_from_pretrained_policy_and_diffusion: bool = False
+    
+    # @dataclass
+    # class DiffusionConfig:
+    #     path: Optional[str] = None  # Path to model checkpoints or .npz file with diffusion samples
+    #     num_steps: int = 128  # Number of diffusion steps
+    #     sample_limit: int = -1  # If not -1, limit the number of diffusion samples to this number
+    
     # Wandb logging
     project: str = "CORL"
     group: str = "Cal-QL-D4RL"
@@ -914,7 +929,7 @@ class CalQL:
             alpha,
             log_dict,
         )
-
+        
         if self.use_automatic_entropy_tuning:
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
@@ -1035,6 +1050,44 @@ def train(config: TrainConfig):
     )
     offline_buffer.load_d4rl_dataset(dataset)
 
+
+    # offline_buffer = prepare_replay_buffer(
+    #     state_dim=state_dim,
+    #     action_dim=action_dim,
+    #     buffer_size=config.buffer_size,
+    #     dataset=dataset,
+    #     env_name=config.env,
+    #     device=config.device,
+    #     reward_normalizer=RewardNormalizer(dataset, config.env) if config.normalize_reward else None,
+    #     state_normalizer=StateNormalizer(state_mean, state_std),
+    #     diffusion_config=config.buffer,
+    # )
+    
+    # online_buffer = prepare_replay_buffer(
+    #     state_dim=state_dim,
+    #     action_dim=action_dim,
+    #     buffer_size=config.buffer_size,
+    #     dataset=dataset,
+    #     env_name=config.env,
+    #     device=config.device,
+    #     reward_normalizer=RewardNormalizer(dataset, config.env) if config.normalize_reward else None,
+    #     state_normalizer=StateNormalizer(state_mean, state_std),
+    #     diffusion_config=config.buffer,
+    # )
+     
+    diffusion_buffer = prepare_replay_buffer(
+        state_dim=state_dim,
+        action_dim=action_dim,
+        buffer_size=config.buffer_size,
+        dataset=dataset,
+        env_name=config.env,
+        device=config.device,
+        reward_normalizer=RewardNormalizer(dataset, config.env) if config.normalize_reward else None,
+        state_normalizer=StateNormalizer(state_mean, state_std),
+        diffusion_config=config.diffusion,
+    )
+    
+
     max_action = float(env.action_space.high[0])
 
     if config.checkpoints_path is not None:
@@ -1123,72 +1176,17 @@ def train(config: TrainConfig):
 
     eval_successes = []
     train_successes = []
-
-    print("Offline pretraining")
-    for t in range(int(config.offline_iterations) + int(config.online_iterations)):
-        if t == config.offline_iterations:
-            print("Online tuning")
-            trainer.switch_calibration()
-            trainer.cql_alpha = config.cql_alpha_online
+    
+    for t in range(config.offline_iterations):
         online_log = {}
-        if t >= config.offline_iterations:
-            episode_step += 1
-            action, _ = actor(
-                torch.tensor(
-                    state.reshape(1, -1),
-                    device=config.device,
-                    dtype=torch.float32,
-                )
-            )
-            action = action.cpu().data.numpy().flatten()
-            next_state, reward, done, env_infos = env.step(action)
-
-            if not goal_achieved:
-                goal_achieved = is_goal_reached(reward, env_infos)
-            episode_return += reward
-            real_done = False  # Episode can timeout which is different from done
-            if done and episode_step < max_steps:
-                real_done = True
-
-            if config.normalize_reward:
-                reward = modify_reward_online(
-                    reward,
-                    config.env,
-                    reward_scale=config.reward_scale,
-                    reward_bias=config.reward_bias,
-                    **reward_mod_dict,
-                )
-            online_buffer.add_transition(state, action, reward, next_state, real_done)
-            state = next_state
-
-            if done:
-                state, done = env.reset(), False
-                # Valid only for envs with goal, e.g. AntMaze, Adroit
-                if is_env_with_goal:
-                    train_successes.append(goal_achieved)
-                    online_log["train/regret"] = np.mean(1 - np.array(train_successes))
-                    online_log["train/is_success"] = float(goal_achieved)
-                online_log["train/episode_return"] = episode_return
-                normalized_return = eval_env.get_normalized_score(episode_return)
-                online_log["train/d4rl_normalized_episode_return"] = (
-                    normalized_return * 100.0
-                )
-                online_log["train/episode_length"] = episode_step
-                episode_return = 0
-                episode_step = 0
-                goal_achieved = False
-
-        if t < config.offline_iterations:
-            batch = offline_buffer.sample(config.batch_size)
-            batch = [b.to(config.device) for b in batch]
-        else:
-            offline_batch = offline_buffer.sample(batch_size_offline)
-            online_batch = online_buffer.sample(batch_size_online)
-            batch = [
-                torch.vstack(tuple(b)).to(config.device)
-                for b in zip(offline_batch, online_batch)
-            ]
-
+        if config.start_from_pretrained_policy_and_diffusion:
+            print(f"Policy and diffusion loaded!")
+            break
+        batch = offline_buffer.sample(config.batch_size)
+        # mc_returns = torch.zeros_like(batch[-1], device=config.device)
+        # batch.append(mc_returns)
+        batch = [b.to(config.device) for b in batch]
+        
         log_dict = trainer.train(batch)
         log_dict["offline_iter" if t < config.offline_iterations else "online_iter"] = (
             t if t < config.offline_iterations else t - config.offline_iterations
@@ -1228,6 +1226,260 @@ def train(config: TrainConfig):
                     os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
                 )
             wandb.log(eval_log, step=trainer.total_it)
+    
+    print("Online Training")
+    trainer.switch_calibration()
+    trainer.cql_alpha = config.cql_alpha_online
+    
+    state, done = env.reset(), False
+    episode_step = 0
+    episode_return = 0
+    goal_achieved = False
+    train_successes = []
+    eval_successes = []
+    for t in range(config.online_iterations):
+        online_log = {}
+        episode_step += 1
+        action, _ = actor(
+            torch.tensor(state.reshape(1, -1), device=config.device, dtype=torch.float32)
+        )
+        action = action.cpu().data.numpy().flatten()
+        next_state, reward, done, env_infos = env.step(action)
+        
+        if not goal_achieved:
+            goal_achieved = is_goal_reached(reward, env_infos)
+        episode_return += reward
+        real_done = done and episode_step < config.max_steps
+
+        if config.normalize_reward:
+            reward = modify_reward_online(
+                reward,
+                config.env,
+                reward_scale=config.reward_scale,
+                reward_bias=config.reward_bias,
+            )
+
+        online_buffer.add_transition(state, action, reward, next_state, real_done)
+        state = next_state
+
+        offline_batch = offline_buffer.sample(config.batch_size_offline)
+        online_batch = online_buffer.sample(config.batch_size_online)
+        augmented_on_policy_batch = diffusion_buffer.augment(
+            target_transitions=[state, action, reward, next_state, real_done],
+            noise_level=0.5,
+            magnification=20,
+        )
+        
+        # append MC returns of the trajectory as 0
+        # https://github.com/liuxhym/EDIS/blob/main/common/buffer.py#L214
+        
+        offline_mc_returns = torch.zeros_like(offline_batch[-1], device=config.device)
+        offline_batch.append(offline_mc_returns)
+        online_mc_returns = torch.zeros_like(online_batch[-1], device=config.device)
+        online_batch.append(online_mc_returns)
+
+        batch = [
+            torch.vstack(tuple(b)).to(config.device)
+            for b in zip(offline_batch, online_batch, augmented_on_policy_batch)
+        ]
+        
+        log_dict = trainer.train(batch)
+        log_dict["offline_iter" if t < config.offline_iterations else "online_iter"] = (
+            t if t < config.offline_iterations else t - config.offline_iterations
+        )
+        log_dict.update(online_log)
+        wandb.log(log_dict, step=trainer.total_it)
+        # Evaluate episode
+        if (t + 1) % config.eval_freq == 0:
+            print(f"Time steps: {t + 1}")
+            eval_scores, success_rate = eval_actor(
+                eval_env,
+                actor,
+                device=config.device,
+                n_episodes=config.n_episodes,
+                seed=config.seed,
+            )
+            eval_score = eval_scores.mean()
+            eval_log = {}
+            normalized = eval_env.get_normalized_score(np.mean(eval_scores))
+            # Valid only for envs with goal, e.g. AntMaze, Adroit
+            if t >= config.offline_iterations and is_env_with_goal:
+                eval_successes.append(success_rate)
+                eval_log["eval/regret"] = np.mean(1 - np.array(train_successes))
+                eval_log["eval/success_rate"] = success_rate
+            normalized_eval_score = normalized * 100.0
+            eval_log["eval/d4rl_normalized_score"] = normalized_eval_score
+            evaluations.append(normalized_eval_score)
+            print("---------------------------------------")
+            print(
+                f"Evaluation over {config.n_episodes} episodes: "
+                f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+            )
+            print("---------------------------------------")
+            if config.checkpoints_path:
+                torch.save(
+                    trainer.state_dict(),
+                    os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
+                )
+            wandb.log(eval_log, step=trainer.total_it)
+            
+            
+        if done:
+            state, done = env.reset(), False
+            # Valid only for envs with goal, e.g. AntMaze, Adroit
+            if is_env_with_goal:
+                train_successes.append(goal_achieved)
+                online_log["train/regret"] = np.mean(1 - np.array(train_successes))
+                online_log["train/is_success"] = float(goal_achieved)
+            online_log["train/episode_return"] = episode_return
+            normalized_return = eval_env.get_normalized_score(episode_return)
+            online_log["train/d4rl_normalized_episode_return"] = (
+                normalized_return * 100.0
+            )
+            online_log["train/episode_length"] = episode_step
+            episode_return = 0
+            episode_step = 0
+            goal_achieved = False
+
+        # 버퍼 초기화
+        if (t + 1) % config.reset_freq == 0:
+            diffusion_buffer.reset_last_layer()
+            diffusion_buffer.train()
+        
+
+    
+    
+
+    # print("Offline pretraining")
+    # for t in range(int(config.offline_iterations) + int(config.online_iterations)):
+    #     if t == config.offline_iterations:
+    #         print("Online tuning")
+    #         trainer.switch_calibration()
+    #         trainer.cql_alpha = config.cql_alpha_online
+    #     online_log = {}
+    #     if t >= config.offline_iterations:
+    #         episode_step += 1
+    #         action, _ = actor(
+    #             torch.tensor(
+    #                 state.reshape(1, -1),
+    #                 device=config.device,
+    #                 dtype=torch.float32,
+    #             )
+    #         )
+    #         action = action.cpu().data.numpy().flatten()
+    #         next_state, reward, done, env_infos = env.step(action)
+
+    #         if not goal_achieved:
+    #             goal_achieved = is_goal_reached(reward, env_infos)
+    #         episode_return += reward
+    #         real_done = False  # Episode can timeout which is different from done
+    #         if done and episode_step < max_steps:
+    #             real_done = True
+
+    #         if config.normalize_reward:
+    #             reward = modify_reward_online(
+    #                 reward,
+    #                 config.env,
+    #                 reward_scale=config.reward_scale,
+    #                 reward_bias=config.reward_bias,
+    #                 **reward_mod_dict,
+    #             )
+    #         online_buffer.add_transition(state, action, reward, next_state, real_done)
+    #         state = next_state
+
+    #         if done:
+    #             state, done = env.reset(), False
+    #             # Valid only for envs with goal, e.g. AntMaze, Adroit
+    #             if is_env_with_goal:
+    #                 train_successes.append(goal_achieved)
+    #                 online_log["train/regret"] = np.mean(1 - np.array(train_successes))
+    #                 online_log["train/is_success"] = float(goal_achieved)
+    #             online_log["train/episode_return"] = episode_return
+    #             normalized_return = eval_env.get_normalized_score(episode_return)
+    #             online_log["train/d4rl_normalized_episode_return"] = (
+    #                 normalized_return * 100.0
+    #             )
+    #             online_log["train/episode_length"] = episode_step
+    #             episode_return = 0
+    #             episode_step = 0
+    #             goal_achieved = False
+            
+    #         # TODO
+    #         if (t + 1) % config.reset_freq == 0:
+    #             diffusion_buffer.reset_last_layer()
+    #             diffusion_buffer.train()
+
+    #     if t < config.offline_iterations:
+    #         batch = offline_buffer.sample(config.batch_size)
+    #         # append MC returns of the trajectory as 0
+    #         # https://github.com/liuxhym/EDIS/blob/main/common/buffer.py#L214
+    #         mc_returns = torch.zeros_like(batch[-1], device=config.device)
+    #         batch.append(mc_returns)
+    #         batch = [b.to(config.device) for b in batch]
+    #     else:
+    #         offline_batch = offline_buffer.sample(batch_size_offline)
+    #         online_batch = online_buffer.sample(batch_size_online)
+    #         # append MC returns of the trajectory as 0
+    #         # https://github.com/liuxhym/EDIS/blob/main/common/buffer.py#L214
+    #         offline_mc_returns = torch.zeros_like(offline_batch[-1], device=config.device)
+    #         offline_batch.append(offline_mc_returns)
+
+    #         online_mc_returns = torch.zeros_like(online_batch[-1], device=config.device)
+    #         online_batch.append(mc_returns)
+            
+    #         # TODO
+    #         augmented_on_policy_batch = diffusion_buffer.augment(
+    #             target_transitions = [state, action, reward, next_state, real_done],
+    #             noise_level = 0.5,
+    #             magnification = 20,
+    #         )
+
+    #         batch = [
+    #             torch.vstack(tuple(b)).to(config.device)
+    #             for b in zip(offline_batch, online_batch, augmented_on_policy_batch)
+    #         ]
+            
+
+
+    #     log_dict = trainer.train(batch)
+    #     log_dict["offline_iter" if t < config.offline_iterations else "online_iter"] = (
+    #         t if t < config.offline_iterations else t - config.offline_iterations
+    #     )
+    #     log_dict.update(online_log)
+    #     wandb.log(log_dict, step=trainer.total_it)
+    #     # Evaluate episode
+    #     if (t + 1) % config.eval_freq == 0:
+    #         print(f"Time steps: {t + 1}")
+    #         eval_scores, success_rate = eval_actor(
+    #             eval_env,
+    #             actor,
+    #             device=config.device,
+    #             n_episodes=config.n_episodes,
+    #             seed=config.seed,
+    #         )
+    #         eval_score = eval_scores.mean()
+    #         eval_log = {}
+    #         normalized = eval_env.get_normalized_score(np.mean(eval_scores))
+    #         # Valid only for envs with goal, e.g. AntMaze, Adroit
+    #         if t >= config.offline_iterations and is_env_with_goal:
+    #             eval_successes.append(success_rate)
+    #             eval_log["eval/regret"] = np.mean(1 - np.array(train_successes))
+    #             eval_log["eval/success_rate"] = success_rate
+    #         normalized_eval_score = normalized * 100.0
+    #         eval_log["eval/d4rl_normalized_score"] = normalized_eval_score
+    #         evaluations.append(normalized_eval_score)
+    #         print("---------------------------------------")
+    #         print(
+    #             f"Evaluation over {config.n_episodes} episodes: "
+    #             f"{eval_score:.3f} , D4RL score: {normalized_eval_score:.3f}"
+    #         )
+    #         print("---------------------------------------")
+    #         if config.checkpoints_path:
+    #             torch.save(
+    #                 trainer.state_dict(),
+    #                 os.path.join(config.checkpoints_path, f"checkpoint_{t}.pt"),
+    #             )
+    #         wandb.log(eval_log, step=trainer.total_it)
 
 
 if __name__ == "__main__":
