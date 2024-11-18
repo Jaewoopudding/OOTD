@@ -4,8 +4,10 @@ wandb/
 online_logs/
 
 fuse.cfg
-
+*.pt
+*.gz
 *.ai
+models/
 
 # Generation results
 results/
