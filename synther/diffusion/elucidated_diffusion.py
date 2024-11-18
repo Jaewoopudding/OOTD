@@ -191,6 +191,61 @@ class ElucidatedDiffusion(nn.Module):
         if clamp:
             inputs = inputs.clamp(-1., 1.)
         return self.normalizer.unnormalize(inputs)
+    
+    
+    def sample_back_and_forth(
+            self,
+            samples: torch.Tensor,
+            num_sample_steps: Optional[int] = None,
+            cond = None,
+            clamp: bool = False,
+            noise_level : float = 0.5,
+            temperature : float = 1.0,
+            magnification : int = 1,
+    ):
+        samples = self.normalizer(samples.to(device=self.device))
+        num_sample_steps = default(num_sample_steps, self.num_sample_steps)
+        T, D = self.event_shape
+        shape = samples.shape
+        
+        sigmas = self.sample_schedule(num_sample_steps)
+        gammas = torch.where(
+            (sigmas >= self.S_tmin) & (sigmas <= self.S_tmax),
+            min(self.S_churn / num_sample_steps, math.sqrt(2) - 1),
+            0.
+        )
+        
+        # magnify the batch_size
+        noise = torch.randn((shape[0] * magnification, *shape[1:]), device=self.device)
+        if noise_level == 1.0:
+            inputs = noise * sigmas[0]
+        else :
+            inputs = samples.repeat_interleave(magnification, dim=0) + noise * sigmas[noise_ts]
+        
+        # gradually denoise
+        for sigma, sigma_next, gamma in sigmas_and_gammas[noise_ts:]:
+            sigma, sigma_next, gamma = map(lambda t: t.item(), (sigma, sigma_next, gamma))
+            eps = self.S_noise * torch.randn(shape, device=self.device)  # stochastic sampling
+            sigma_hat = sigma + gamma * sigma
+            inputs_hat = inputs + math.sqrt(sigma_hat ** 2 - sigma ** 2) * eps
+
+            denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=cond)
+            uncond_denoised_over_sigma = self.score_fn(inputs_hat, sigma_hat, clamp=clamp, cond=None)
+            denoised_over_sigma = uncond_denoised_over_sigma + temperature * (denoised_over_sigma - uncond_denoised_over_sigma)
+            inputs_next = inputs_hat + (sigma_next - sigma_hat) * denoised_over_sigma
+            
+            if sigma_next != 0:
+                if temperature==0:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=None)
+                else:
+                    denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
+                inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
+                        denoised_over_sigma + denoised_prime_over_sigma)
+            input = input_next
+            
+        if clamp:
+            inputs = inputs.clamp(-1., 1.)
+        return self.normalizer.unnormalize(inputs)
 
     # This is known as 'denoised_over_sigma' in the lucidrains repo.
     def score_fn(
