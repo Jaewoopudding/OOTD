@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 python /home/taeyoung/jaewoo/OOTD/synther/offline-to-online/cal_ql.py --env halfcheetah-medium-v2 --diffusion.path /home/taeyoung/jaewoo/OOTD/models/halfcheetah-medium-v2/model-100000.pt
