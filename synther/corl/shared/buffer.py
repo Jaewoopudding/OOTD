@@ -278,6 +278,43 @@ class DiffusionGenerator(ReplayBufferBase):
             self.cache_pointer += batch_size
             return batch
 
+    def augment(
+        self,
+        target_transitions: TensorBatch, # (state, action, reward, next_state, real_done)
+        noise_level: float,
+        maginification: int,
+        cond=None,
+        temperature=1.0
+    ) -> TensorBatch:
+        augmented_transitions = self.diffusion_back_and_forth(
+            sample=target_transitions,
+            num_sample_steps=self.num_sample_steps,
+            cond=cond,
+            clamp=self.clamp_samples,
+            noise_level=noise_level,
+            temperature=temperature,
+            magnification=manification
+        )
+        augmented_transitions = split_diffusion_samples(augmented_transitions, self.env) ## TODO : Terminal modeling issue
+        
+        if len(augmented_transitions) == 4: ## The case when the terminal is not modelled 
+            observations, actions, rewards, next_observations = augmented_transitions
+            terminals = torch.zeros_like(next_observations[..., 0]).float()
+        else: # the case when the terminal is modelled. This if statement is controlled by the 
+              # modelled_terminals parameter in split_diffusion_samples function. 
+            observations, actions, rewards, next_observations, terminals = augmented_transitions
+            
+        # if self.replay_buffer is not None:
+        #     self.replay_buffer.add_transition_batch(
+        #         [observations, actions, rewards[..., None], next_observations, terminals[..., None]])
+        #     print(f'Samples collected: {self.replay_buffer._pointer}.')
+        return [observations, actions, rewards, next_observations, terminals]
+
+    def reset_last_layer(self):
+        pass
+    
+    def train(self):
+        pass
 
 def prepare_replay_buffer(
         state_dim: int,
