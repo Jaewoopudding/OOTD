@@ -1,7 +1,6 @@
 import gym
-import numpy as np
+import torch
 from gym.wrappers.flatten_observation import FlattenObservation
-from redq.algos.core import ReplayBuffer
 
 
 def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
@@ -18,16 +17,18 @@ def wrap_gym(env: gym.Env, rescale_actions: bool = True) -> gym.Env:
 
 # Make transition dataset from REDQ replay buffer.
 def make_inputs_from_replay_buffer(
-        replay_buffer: ReplayBuffer,
+        replay_buffer,
         model_terminals: bool = False,
-) -> np.ndarray:
-    ptr_location = replay_buffer.ptr
-    obs = replay_buffer.obs1_buf[:ptr_location]
-    actions = replay_buffer.acts_buf[:ptr_location]
-    next_obs = replay_buffer.obs2_buf[:ptr_location]
-    rewards = replay_buffer.rews_buf[:ptr_location]
-    inputs = [obs, actions, rewards[:, None], next_obs]
+) -> torch.tensor:
+    ptr_location = replay_buffer._pointer
+    obs = replay_buffer._states[:ptr_location]
+    actions = replay_buffer._actions[:ptr_location]
+    next_obs = replay_buffer._next_states[:ptr_location]
+    rewards = replay_buffer._rewards[:ptr_location]
+    inputs = [obs, actions, rewards, next_obs]
+    
     if model_terminals:
-        terminals = replay_buffer.done_buf[:ptr_location].astype(np.float32)
-        inputs.append(terminals[:, None])
-    return np.concatenate(inputs, axis=1)
+        terminals = replay_buffer._dones[:ptr_location].to(torch.float32)
+        inputs.append(terminals)
+    
+    return torch.cat(inputs, dim=1)
