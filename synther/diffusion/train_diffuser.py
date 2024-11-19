@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import wandb
 
-from synther.diffusion.elucidated_diffusion import Trainer
+from synther.diffusion.elucidated_diffusion import OnlineTrainer
 from synther.diffusion.norm import MinMaxNormalizer
 from synther.diffusion.utils import make_inputs, split_diffusion_samples, construct_diffusion_model
 
@@ -113,7 +113,7 @@ if __name__ == '__main__':
 
     # Create the diffusion model and trainer.
     diffusion = construct_diffusion_model(inputs=inputs)
-    trainer = Trainer(
+    trainer = OnlineTrainer(
         diffusion,
         dataset,
         results_folder=args.results_folder,

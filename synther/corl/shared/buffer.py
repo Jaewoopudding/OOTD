@@ -7,9 +7,16 @@ import gin
 import gym
 import numpy as np
 import torch
+import torch.nn.init as init
+
+from torch.utils.data import DataLoader
+
+import gin
+from accelerate import Accelerator
 
 from synther.diffusion.norm import MinMaxNormalizer
 from synther.diffusion.utils import make_inputs, construct_diffusion_model, split_diffusion_samples
+from synther.diffusion.elucidated_diffusion import OnlineTrainer
 
 TensorBatch = List[torch.Tensor]
 
@@ -19,6 +26,7 @@ class DiffusionConfig:
     path: Optional[str] = None  # Path to model checkpoints or .npz file with diffusion samples
     num_steps: int = 128  # Number of diffusion steps
     sample_limit: int = -1  # If not -1, limit the number of diffusion samples to this number
+
 
 
 def return_reward_range(dataset, max_episode_steps):
@@ -185,6 +193,7 @@ class ReplayBuffer(ReplayBufferBase):
         self._pointer += batch_size
 
 
+@gin.configurable
 class DiffusionGenerator(ReplayBufferBase):
     def __init__(
             self,
@@ -202,12 +211,13 @@ class DiffusionGenerator(ReplayBufferBase):
             device, reward_normalizer, state_normalizer,
         )
         # Create the environment
+        self.diffusion_path = diffusion_path
         self.env = gym.make(env_name)
         inputs = make_inputs(self.env)
         inputs = torch.from_numpy(inputs).float()
         self.diffusion = construct_diffusion_model(inputs=inputs).to(device)
 
-        data = torch.load(diffusion_path)
+        data = torch.load(self.diffusion_path)
         if use_ema:
             ema_dict = data['ema']
             ema_dict = {k: v for k, v in ema_dict.items() if k.startswith('ema_model')}
@@ -215,6 +225,7 @@ class DiffusionGenerator(ReplayBufferBase):
             self.diffusion.load_state_dict(ema_dict)
         else:
             self.diffusion.load_state_dict(data['model'])
+            
         self.diffusion.eval()
         # Clamp samples if normalizer is MinMaxNormalizer
         self.clamp_samples = isinstance(self.diffusion.normalizer, MinMaxNormalizer)
@@ -282,39 +293,69 @@ class DiffusionGenerator(ReplayBufferBase):
         self,
         target_transitions: TensorBatch, # (state, action, reward, next_state, real_done)
         noise_level: float,
-        maginification: int,
+        magnification: int,
         cond=None,
         temperature=1.0
     ) -> TensorBatch:
-        augmented_transitions = self.diffusion_back_and_forth(
-            sample=target_transitions,
-            num_sample_steps=self.num_sample_steps,
+        target_transitions = torch.cat(target_transitions)[None, :] ## TODO: terminal case
+        augmented_transitions = self.diffusion.sample_back_and_forth(
+            samples=target_transitions,
+            num_sample_steps=self.num_steps,
             cond=cond,
             clamp=self.clamp_samples,
             noise_level=noise_level,
             temperature=temperature,
-            magnification=manification
+            magnification=magnification
         )
         augmented_transitions = split_diffusion_samples(augmented_transitions, self.env) ## TODO : Terminal modeling issue
         
         if len(augmented_transitions) == 4: ## The case when the terminal is not modelled 
             observations, actions, rewards, next_observations = augmented_transitions
             terminals = torch.zeros_like(next_observations[..., 0]).float()
-        else: # the case when the terminal is modelled. This if statement is controlled by the 
-              # modelled_terminals parameter in split_diffusion_samples function. 
+            
+        # the case when the terminal is modelled. This if statement is controlled by the 
+        # modelled_terminals parameter in split_diffusion_samples function. 
+        else: 
             observations, actions, rewards, next_observations, terminals = augmented_transitions
             
         # if self.replay_buffer is not None:
         #     self.replay_buffer.add_transition_batch(
         #         [observations, actions, rewards[..., None], next_observations, terminals[..., None]])
         #     print(f'Samples collected: {self.replay_buffer._pointer}.')
-        return [observations, actions, rewards, next_observations, terminals]
+        return [observations, actions, rewards[:, None], next_observations, terminals[:, None]]
 
-    def reset_last_layer(self):
-        pass
+    def reset_last_layer(self, num_of_layers):
+        state_dict = self.diffusion.net.state_dict()
+        
+        init.xavier_uniform_(state_dict[f"residual_mlp.final_linear.weight"])
+        state_dict[f"residual_mlp.final_linear.bias"].zero_() 
+
+        if num_of_layers > 1:
+            for i in range(num_of_layers - 1):
+                init.xavier_uniform_(state_dict[f"residual_mlp.network.{6 - i}.linear.weight"])
+                state_dict[f"residual_mlp.network.{6 - i}.linear.bias"].zero_()  
+                
+        self.diffusion.net.load_state_dict(state_dict)
+            
+    def initialize_training_diffusion(self):
+        online_dir = os.path.dirname(self.diffusion_path)
+        online_dir += "/online_training"
+        
+        
+        self.diffusion_trainer = OnlineTrainer(
+        self.diffusion,
+        results_folder=online_dir,
+        )
+        self.diffusion_trainer.load(self.diffusion_path)
     
-    def train(self):
-        pass
+    
+    def train(self, buffer):
+        self.diffusion_trainer.update_normalizer(buffer)
+        self.diffusion_trainer.train_from_online_buffer(buffer)
+        
+    
+
+    
 
 def prepare_replay_buffer(
         state_dim: int,
@@ -360,7 +401,7 @@ def prepare_replay_buffer(
         )
         replay_buffer.load_d4rl_dataset(diffusion_dataset)
     elif diffusion_config.path.endswith(".pt"):
-        print('Loading diffusion model.')
+        print(f'Loading diffusion model from {diffusion_config.path}.')
         # Load gin config from the same directory.
         gin_path = os.path.join(os.path.dirname(diffusion_config.path), 'config.gin')
         gin.parse_config_file(gin_path, skip_unknown=True)

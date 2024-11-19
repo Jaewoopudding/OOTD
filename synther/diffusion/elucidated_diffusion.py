@@ -15,7 +15,6 @@ import wandb
 from accelerate import Accelerator
 from einops import reduce
 from ema_pytorch import EMA
-from redq.algos.core import ReplayBuffer
 from torch import nn
 from torch.utils.data import DataLoader
 from torchdiffeq import odeint
@@ -203,9 +202,8 @@ class ElucidatedDiffusion(nn.Module):
             temperature : float = 1.0,
             magnification : int = 1,
     ):
-        samples = self.normalizer(samples.to(device=self.device))
+        samples = self.normalizer.normalize(samples)
         num_sample_steps = default(num_sample_steps, self.num_sample_steps)
-        T, D = self.event_shape
         shape = samples.shape
         
         sigmas = self.sample_schedule(num_sample_steps)
@@ -214,6 +212,13 @@ class ElucidatedDiffusion(nn.Module):
             min(self.S_churn / num_sample_steps, math.sqrt(2) - 1),
             0.
         )
+        
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[:-1]))
+        noise_ts = int(num_sample_steps*(1-noise_level))
+
+        # inputs are noise at the beginning
+        init_sigma = sigmas[0]
+        inputs = init_sigma * torch.randn(shape, device=self.device)
         
         # magnify the batch_size
         noise = torch.randn((shape[0] * magnification, *shape[1:]), device=self.device)
@@ -241,11 +246,11 @@ class ElucidatedDiffusion(nn.Module):
                     denoised_prime_over_sigma = self.score_fn(inputs_next, sigma_next, clamp=clamp, cond=cond)
                 inputs_next = inputs_hat + 0.5 * (sigma_next - sigma_hat) * (
                         denoised_over_sigma + denoised_prime_over_sigma)
-            input = input_next
+            inputs = inputs_next
             
         if clamp:
             inputs = inputs.clamp(-1., 1.)
-        return self.normalizer.unnormalize(inputs)
+        return self.normalizer.unnormalize(inputs).detach()
 
     # This is known as 'denoised_over_sigma' in the lucidrains repo.
     def score_fn(
@@ -561,7 +566,7 @@ class Trainer(object):
 
 
 @gin.configurable
-class REDQTrainer(Trainer):
+class OnlineTrainer(Trainer):
     def __init__(
             self,
             diffusion_model,
@@ -579,7 +584,7 @@ class REDQTrainer(Trainer):
             amp: bool = False,
             fp16: bool = False,
             split_batches: bool = True,
-            model_terminals: bool = False,
+            model_terminals: bool = True,
     ):
         super().__init__(
             diffusion_model,
@@ -602,29 +607,45 @@ class REDQTrainer(Trainer):
 
         self.model_terminals = model_terminals
 
-    def train_from_redq_buffer(self, buffer: ReplayBuffer, num_steps: Optional[int] = None):
+    def train_from_online_buffer(self, buffer, num_steps: Optional[int] = None):
         num_steps = num_steps or self.train_num_steps
         for j in range(num_steps):
-            b = buffer.sample_batch(self.batch_size)
-            obs = b['obs1']
-            next_obs = b['obs2']
-            actions = b['acts']
-            rewards = b['rews'][:, None]
-            done = b['done'][:, None]
+            obs, actions, rewards, next_obs, done, mc_returns = buffer.sample(self.batch_size)
+            # obs = b['obs1']
+            # next_obs = b['obs2']
+            # actions = b['acts']
+            # rewards = b['rews'][:, None]
+            # done = b['done'][:, None]
             data = [obs, actions, rewards, next_obs]
             if self.model_terminals:
                 data.append(done)
-            data = np.concatenate(data, axis=1)
-            data = torch.from_numpy(data).float()
+            data = torch.cat(data, dim=1)
+            # data = torch.from_numpy(data).float()
             loss = self.train_on_batch(data, use_wandb=False)
             if j % 1000 == 0:
                 print(f'[{j}/{num_steps}] loss: {loss:.4f}')
 
-    def update_normalizer(self, buffer: ReplayBuffer, device=None):
+    def update_normalizer(self, buffer, device=None):
         data = make_inputs_from_replay_buffer(buffer, self.model_terminals)
-        data = torch.from_numpy(data).float()
+        # data = torch.from_numpy(data).float()
         self.model.normalizer.reset(data)
         self.ema.ema_model.normalizer.reset(data)
         if device:
             self.model.normalizer.to(device)
             self.ema.ema_model.normalizer.to(device)
+
+    def load(self, diffusion_path):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(diffusion_path, map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        self.ema.load_state_dict(data['ema'])
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
