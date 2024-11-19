@@ -5,12 +5,12 @@ buffer_size: 10000000
 eval_freq: 50000
 discount: 0.99
 
-env: halfcheetah-medium-replay-v2
-load_model: models/${env}/checkpoint_299999_seed_0_pretrained.pt
+env: halfcheetah-medium-expert-v2
+# load_model: models/${env}/checkpoint_299999_seed_0_pretrained.pt
 
 offline_iterations: 300000
 online_iterations: 200000
-mixing_ratio: 0.2
+mixing_ratio: 0.5
 
 normalize: true
 normalize_reward: true
