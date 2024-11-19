@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from tqdm import trange
 import sys
-sys.path.append('/home/taeyoung/jaewoo/OOTD')
 
 import d4rl
 import gym
@@ -82,6 +81,7 @@ class TrainConfig:
     utd: int = 1
     noise_level: float = 0.5
     magnification: int = 128
+    halt_of_augmentation: bool = False
     
     # @dataclass
     # class DiffusionConfig:
@@ -1018,7 +1018,6 @@ class CalQL:
 def train(config: TrainConfig):
     env = gym.make(config.env)
     eval_env = gym.make(config.env)
-
     is_env_with_goal = config.env.startswith(ENVS_WITH_GOAL)
     batch_size_offline = int(config.batch_size * config.mixing_ratio)
     batch_size_online = config.batch_size - batch_size_offline
@@ -1029,7 +1028,6 @@ def train(config: TrainConfig):
     action_dim = env.action_space.shape[0]
 
     dataset = d4rl.qlearning_dataset(env)
-
     reward_mod_dict = {}
     if config.normalize_reward:
         reward_mod_dict = modify_reward(
@@ -1093,7 +1091,7 @@ def train(config: TrainConfig):
     #     state_normalizer=StateNormalizer(state_mean, state_std),
     #     diffusion_config=config.buffer,
     # )
-     
+    
     diffusion_buffer = prepare_replay_buffer(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -1179,7 +1177,7 @@ def train(config: TrainConfig):
     # Initialize actor
     trainer = CalQL(**kwargs)
 
-    if config.load_model != "":
+    if config.load_model not in ["", "False", "None"] :
         policy_file = Path(config.load_model)
         trainer.load_state_dict(torch.load(policy_file))
         actor = trainer.actor
@@ -1242,8 +1240,9 @@ def train(config: TrainConfig):
                 )
             wandb.log(eval_log, step=trainer.total_it)
     
-    print("Initialize Diffusion Trainer")
-    diffusion_buffer.initialize_training_diffusion()
+    if not config.halt_of_augmentation:
+        print("Initialize Diffusion Trainer")
+        diffusion_buffer.initialize_training_diffusion()
     
     
     print("Online Training")
@@ -1277,6 +1276,7 @@ def train(config: TrainConfig):
                 config.env,
                 reward_scale=config.reward_scale,
                 reward_bias=config.reward_bias,
+                **reward_mod_dict
             )
 
         online_buffer.add_transition(state, action, reward, next_state, real_done)
@@ -1288,19 +1288,24 @@ def train(config: TrainConfig):
         for _ in range(config.utd):
             offline_batch = offline_buffer.sample(batch_size_offline)
             online_batch = online_buffer.sample(batch_size_online)
-            augmented_on_policy_batch = diffusion_buffer.augment(
-                target_transitions=latest_transition,
-                noise_level=config.noise_level,
-                magnification=config.magnification,
-            )
-            # append MC returns of the trajectory as 0
-            # https://github.com/liuxhym/EDIS/blob/main/common/buffer.py#L214
-            augmented_mc_returns = torch.zeros_like(augmented_on_policy_batch[2], device=config.device)
-            augmented_on_policy_batch.append(augmented_mc_returns)
-            
             batch = []
-            for i in range(len(offline_batch)):
-                batch.append(torch.cat([offline_batch[i], online_batch[i]]))
+            if not config.halt_of_augmentation:
+                augmented_on_policy_batch = diffusion_buffer.augment(
+                    target_transitions=latest_transition,
+                    noise_level=config.noise_level,
+                    magnification=config.magnification,
+                )
+                # append MC returns of the trajectory as 0
+                # https://github.com/liuxhym/EDIS/blob/main/common/buffer.py#L214
+                augmented_mc_returns = torch.zeros_like(augmented_on_policy_batch[2], device=config.device)
+                augmented_on_policy_batch.append(augmented_mc_returns)
+                for i in range(len(offline_batch)):
+                    batch.append(torch.cat([offline_batch[i], online_batch[i], augmented_on_policy_batch[i]]))
+                    
+            else:
+                for i in range(len(offline_batch)):
+                    batch.append(torch.cat([offline_batch[i], online_batch[i]]))
+            
             log_dict = trainer.train(batch) # Log only the last training log
             
         log_dict["online_iter"] = (t)
@@ -1359,11 +1364,12 @@ def train(config: TrainConfig):
             goal_achieved = False
 
         # 버퍼 초기화
-        if (t + 1) % config.reset_freq == 0:
-            diffusion_buffer.reset_last_layer(num_of_layers=1)
-            
-        if (t + 1) % config.continual_learning_freq == 0:
-            diffusion_buffer.train(online_buffer)
+        if not config.halt_of_augmentation:
+            if (t + 1) % config.reset_freq == 0:
+                diffusion_buffer.reset_last_layer(num_of_layers=1)
+                
+            if (t + 1) % config.continual_learning_freq == 0:
+                diffusion_buffer.train(online_buffer)
     
 
 if __name__ == "__main__":
