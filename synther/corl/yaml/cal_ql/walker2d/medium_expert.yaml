@@ -1,0 +1,22 @@
+device: cuda
+checkpoints_path: models
+
+buffer_size: 10000000
+eval_freq: 50000
+discount: 0.99
+
+env: halfcheetah-medium-expert-v2
+load_model: models/${env}/checkpoint_299999_seed_0_pretrained.pt
+
+offline_iterations: 300000
+online_iterations: 200000
+mixing_ratio: 0.2
+
+normalize: true
+normalize_reward: true
+q_n_hidden_layers: 2
+cql_alpha: 10.0
+cql_alpha_online: 10.0
+
+
+
